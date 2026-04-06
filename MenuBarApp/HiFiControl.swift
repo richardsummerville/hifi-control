@@ -12,6 +12,10 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     var cxnHost: String = "192.168.x.x"
     var tvHost: String = "192.168.x.x"
     var tvMAC: String = ""
+    var shieldHost: String = "192.168.x.x"
+    var xboxHost: String = "192.168.x.x"
+    var plexHost: String = "192.168.x.x"
+    var plexToken: String = ""
 
     override init() {
         super.init()
@@ -35,6 +39,10 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
                 case "TV_MAC": tvMAC = val
                 case "CXN_IP": cxnHost = val
                 case "TV_IP": tvHost = val
+                case "SHIELD_IP": shieldHost = val
+                case "XBOX_IP": xboxHost = val
+                case "PLEX_IP": plexHost = val
+                case "PLEX_TOKEN": plexToken = val
                 default: break
                 }
             }
@@ -400,16 +408,62 @@ class LGTVController {
     }
 }
 
-// MARK: - NVIDIA Shield Status
+// MARK: - NVIDIA Shield Control (ADB)
 
 class ShieldController {
-    let host = "192.168.x.x"
+    var host: String { DeviceDiscovery.shared.shieldHost }
+    private let adbPath = "/opt/homebrew/bin/adb"
+
+    private func runADB(_ args: [String], completion: @escaping (Bool, String?) -> Void) {
+        DispatchQueue.global().async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: self.adbPath)
+            process.arguments = ["-s", "\(self.host):5555"] + args
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8)
+                completion(process.terminationStatus == 0, output)
+            } catch {
+                completion(false, nil)
+            }
+        }
+    }
+
+    func ensureConnected(completion: @escaping (Bool) -> Void) {
+        runADB(["connect", "\(host):5555"]) { ok, output in
+            let connected = output?.contains("connected") == true
+            completion(connected)
+        }
+    }
 
     func getState(completion: @escaping (Bool?) -> Void) {
+        // Check screen state via ADB — more reliable than Cast API
+        runADB(["shell", "dumpsys", "power"], timeout: 3) { ok, output in
+            guard ok, let output = output else {
+                // ADB failed — fall back to Cast API
+                self.getCastState(completion: completion)
+                return
+            }
+            if output.contains("mWakefulness=Awake") {
+                completion(true)
+            } else if output.contains("mWakefulness=Asleep") || output.contains("mWakefulness=Dozing") {
+                completion(false)
+            } else {
+                completion(nil)
+            }
+        }
+    }
+
+    private func getCastState(completion: @escaping (Bool?) -> Void) {
         let url = URL(string: "http://\(host):8008/setup/eureka_info?params=name")!
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
-        URLSession.shared.dataTask(with: request) { data, _, error in
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             if let data = data,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                json["name"] != nil {
@@ -419,12 +473,65 @@ class ShieldController {
             }
         }.resume()
     }
+
+    func wake(completion: @escaping (Bool) -> Void) {
+        ensureConnected { [self] _ in
+            runADB(["shell", "input", "keyevent", "KEYCODE_WAKEUP"]) { ok, _ in
+                completion(ok)
+            }
+        }
+    }
+
+    func sleep(completion: @escaping (Bool) -> Void) {
+        runADB(["shell", "input", "keyevent", "KEYCODE_SLEEP"]) { ok, _ in
+            completion(ok)
+        }
+    }
+
+    func launchPlex(completion: @escaping (Bool) -> Void) {
+        ensureConnected { [self] _ in
+            // Wake first, then launch Plex
+            runADB(["shell", "input", "keyevent", "KEYCODE_WAKEUP"]) { [self] _, _ in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    self.runADB(["shell", "am", "start", "-n",
+                                 "com.plexapp.android/com.plexapp.plex.activities.SplashActivity"]) { ok, _ in
+                        completion(ok)
+                    }
+                }
+            }
+        }
+    }
+
+    // Run ADB with a timeout
+    private func runADB(_ args: [String], timeout: TimeInterval, completion: @escaping (Bool, String?) -> Void) {
+        DispatchQueue.global().async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: self.adbPath)
+            process.arguments = ["-s", "\(self.host):5555"] + args
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                let deadline = DispatchTime.now() + timeout
+                DispatchQueue.global().asyncAfter(deadline: deadline) {
+                    if process.isRunning { process.terminate() }
+                }
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8)
+                completion(process.terminationStatus == 0, output)
+            } catch {
+                completion(false, nil)
+            }
+        }
+    }
 }
 
 // MARK: - Xbox Status
 
 class XboxController {
-    let host = "192.168.x.x"
+    var host: String { DeviceDiscovery.shared.xboxHost }
 
     func getState(completion: @escaping (Bool?) -> Void) {
         // Xbox responds to SSDP unicast when awake, silent in standby
@@ -461,6 +568,51 @@ class XboxController {
                 completion(false)
             }
         }
+    }
+}
+
+// MARK: - Plex Server
+
+class PlexController {
+    var host: String { DeviceDiscovery.shared.plexHost }
+    var token: String { DeviceDiscovery.shared.plexToken }
+
+    func getState(completion: @escaping (Bool?, Int?) -> Void) {
+        guard !token.isEmpty else { completion(nil, nil); return }
+        let url = URL(string: "http://\(host):32400/status/sessions?X-Plex-Token=\(token)")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data,
+                  let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let text = String(data: data, encoding: .utf8) else {
+                completion(nil, nil)
+                return
+            }
+            // Server is reachable
+            // Count active sessions from size attribute
+            if let range = text.range(of: "size=\"") {
+                let start = range.upperBound
+                if let end = text[start...].firstIndex(of: "\"") {
+                    let count = Int(text[start..<end]) ?? 0
+                    completion(true, count)
+                    return
+                }
+            }
+            completion(true, 0)
+        }.resume()
+    }
+
+    func scanLibrary(_ key: String, completion: @escaping (Bool) -> Void) {
+        guard !token.isEmpty else { completion(false); return }
+        let url = URL(string: "http://\(host):32400/library/sections/\(key)/refresh?X-Plex-Token=\(token)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 5
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            completion(ok)
+        }.resume()
     }
 }
 
@@ -591,15 +743,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let tv = LGTVController()
     let shield = ShieldController()
     let xbox = XboxController()
+    let plex = PlexController()
     var cxnPowerState: Bool?
     var tvPowerState: Bool?
     var shieldPowerState: Bool?
     var xboxPowerState: Bool?
+    var plexOnline: Bool?
+    var plexSessions: Int = 0
     var roonRunning: Bool = false
     var statusTimer: Timer?
     var cxnToggle: ToggleRowView!
     var tvToggle: ToggleRowView!
+    var shieldToggle: ToggleRowView!
     var roonToggle: ToggleRowView!
+    var plexToggle: ToggleRowView!
     var busyLock = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -654,11 +811,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tvItem.view = tvToggle
         menu.addItem(tvItem)
 
-        // Shield Status (display only — controlled via CEC from TV)
-        let shieldRow = StatusRowView(title: "NVIDIA Shield", icon: "gamecontroller.fill", isOn: shieldPowerState)
-        shieldRow.statusLabel.stringValue = shieldPowerState == true ? "On  ·  via HDMI-CEC" : "Off"
+        // Shield Toggle (ADB control)
+        shieldToggle = ToggleRowView(title: "NVIDIA Shield", icon: "gamecontroller.fill")
+        shieldToggle.setState(shieldPowerState == true)
+        shieldToggle.setStatus(shieldPowerState == true ? "Awake" : shieldPowerState == false ? "Asleep" : "Unreachable")
+        shieldToggle.iconView.contentTintColor = shieldPowerState == true ? .controlAccentColor : .secondaryLabelColor
+        shieldToggle.onToggle = { [weak self] on in
+            self?.toggleShield(on)
+        }
         let shieldItem = NSMenuItem()
-        shieldItem.view = shieldRow
+        shieldItem.view = shieldToggle
         menu.addItem(shieldItem)
 
         // Xbox Status (display only — CEC linked to TV, independent power)
@@ -689,6 +851,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let roonItem = NSMenuItem()
         roonItem.view = roonToggle
         menu.addItem(roonItem)
+
+        // Plex Toggle (wakes Shield + launches Plex)
+        let plexStatus: String
+        if plexOnline == true {
+            plexStatus = plexSessions > 0 ? "\(plexSessions) active stream\(plexSessions == 1 ? "" : "s")" : "Server idle"
+        } else {
+            plexStatus = "Server offline"
+        }
+        plexToggle = ToggleRowView(title: "Plex", icon: "film.fill")
+        plexToggle.setState(shieldPowerState == true && plexOnline == true)
+        plexToggle.setStatus(plexStatus)
+        plexToggle.iconView.contentTintColor = plexOnline == true ? .systemOrange : .secondaryLabelColor
+        plexToggle.onToggle = { [weak self] on in
+            self?.togglePlex(on)
+        }
+        let plexItem = NSMenuItem()
+        plexItem.view = plexToggle
+        menu.addItem(plexItem)
+
+        // Plex Scan submenu
+        if plexOnline == true {
+            let scanItem = NSMenuItem(title: "  Scan Library", action: nil, keyEquivalent: "")
+            let scanMenu = NSMenu()
+            let scanMovies = NSMenuItem(title: "Movies", action: #selector(scanPlexMovies), keyEquivalent: "")
+            scanMovies.target = self
+            let scanTV = NSMenuItem(title: "TV Programmes", action: #selector(scanPlexTV), keyEquivalent: "")
+            scanTV.target = self
+            let scanMusic = NSMenuItem(title: "Music", action: #selector(scanPlexMusic), keyEquivalent: "")
+            scanMusic.target = self
+            scanMenu.addItem(scanMovies)
+            scanMenu.addItem(scanTV)
+            scanMenu.addItem(scanMusic)
+            scanItem.submenu = scanMenu
+            scanItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+            menu.addItem(scanItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -727,6 +925,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if power == true { self?.tv.knownOff = false }
                 self?.tvPowerState = power
+                self?.buildMenuIfNeeded()
+            }
+        }
+
+        shield.getState { [weak self] power in
+            DispatchQueue.main.async {
                 self?.shieldPowerState = power
                 self?.buildMenuIfNeeded()
             }
@@ -735,6 +939,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         xbox.getState { [weak self] power in
             DispatchQueue.main.async {
                 self?.xboxPowerState = power
+                self?.buildMenuIfNeeded()
+            }
+        }
+
+        plex.getState { [weak self] online, sessions in
+            DispatchQueue.main.async {
+                self?.plexOnline = online
+                self?.plexSessions = sessions ?? 0
                 self?.buildMenuIfNeeded()
             }
         }
@@ -834,6 +1046,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    func toggleShield(_ on: Bool) {
+        guard !busyLock else { return }
+        busyLock = true
+        shieldToggle.setStatus(on ? "Waking…" : "Sleeping…")
+        shieldToggle.setEnabled(false)
+
+        if on {
+            shield.wake { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self?.busyLock = false
+                    self?.pollState()
+                }
+            }
+        } else {
+            shield.sleep { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self?.busyLock = false
+                    self?.pollState()
+                }
+            }
+        }
+    }
+
+    func togglePlex(_ on: Bool) {
+        guard !busyLock else { return }
+        busyLock = true
+        plexToggle.setStatus(on ? "Launching…" : "Stopping…")
+        plexToggle.setEnabled(false)
+
+        if on {
+            // Wake Shield and launch Plex
+            shield.launchPlex { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    self?.busyLock = false
+                    self?.pollState()
+                }
+            }
+        } else {
+            // Sleep the Shield (closes Plex)
+            shield.sleep { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self?.busyLock = false
+                    self?.pollState()
+                }
+            }
+        }
+    }
+
+    @objc func scanPlexMovies() { plex.scanLibrary("1") { _ in } }
+    @objc func scanPlexTV() { plex.scanLibrary("3") { _ in } }
+    @objc func scanPlexMusic() { plex.scanLibrary("2") { _ in } }
 
     @objc func toggleLaunchAtLogin() {
         Settings.shared.launchAtLogin.toggle()
