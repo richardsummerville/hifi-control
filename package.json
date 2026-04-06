@@ -1,0 +1,13 @@
+{
+  "name": "home-control",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Network control for LG TV and Cambridge Audio CXN v2",
+  "scripts": {
+    "test": "echo ok"
+  },
+  "dependencies": {
+    "lgtv2": "^1.6.3",
+    "ws": "^8.20.0"
+  }
+}

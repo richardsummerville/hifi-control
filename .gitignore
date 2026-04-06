@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+*.o
+MenuBarApp/HiFiControl
+MenuBarApp/HiFi Control.app/Contents/MacOS/HiFi Control
