@@ -308,33 +308,47 @@ class LGTVController {
             return
         }
 
-        let timeout = DispatchWorkItem {
+        var completed = false
+        let finish: (Bool?) -> Void = { result in
+            guard !completed else { return }
+            completed = true
             task.cancel(with: .goingAway, reason: nil)
-            completion(nil)
+            completion(result)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
+
+        let timeout = DispatchWorkItem { finish(nil) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: timeout)
 
         task.send(.string(regJson)) { error in
             if error != nil {
                 timeout.cancel()
-                task.cancel(with: .goingAway, reason: nil)
-                completion(nil)
+                finish(nil)
                 return
             }
-            task.receive { result in
-                timeout.cancel()
-                switch result {
-                case .success(let msg):
-                    if case .string(let text) = msg, text.contains("registered") {
-                        completion(true)
-                    } else {
-                        completion(nil)
-                    }
-                case .failure:
-                    completion(nil)
+            // LG SSAP sends multiple messages (hello, then registration response)
+            // Read up to 5 messages looking for the "registered" confirmation
+            func readNext(_ remaining: Int) {
+                guard remaining > 0 else {
+                    timeout.cancel()
+                    finish(nil)
+                    return
                 }
-                task.cancel(with: .goingAway, reason: nil)
+                task.receive { result in
+                    switch result {
+                    case .success(let msg):
+                        if case .string(let text) = msg, text.contains("registered") {
+                            timeout.cancel()
+                            finish(true)
+                        } else {
+                            readNext(remaining - 1)
+                        }
+                    case .failure:
+                        timeout.cancel()
+                        finish(nil)
+                    }
+                }
             }
+            readNext(5)
         }
     }
 
@@ -402,6 +416,26 @@ class ShieldController {
                 completion(true)
             } else {
                 completion(nil)
+            }
+        }.resume()
+    }
+}
+
+// MARK: - Xbox Status
+
+class XboxController {
+    let host = "192.168.x.x"
+
+    func getState(completion: @escaping (Bool?) -> Void) {
+        // Xbox exposes UPnP on port 2869 when awake
+        let url = URL(string: "http://\(host):2869/upnphost/udhisapi.dll?content=uuid:94234162-37d7-454d-9d9f-bc3c5de88df3")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                completion(true)
+            } else {
+                completion(false)
             }
         }.resume()
     }
@@ -533,9 +567,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let cxn = CXNController()
     let tv = LGTVController()
     let shield = ShieldController()
+    let xbox = XboxController()
     var cxnPowerState: Bool?
     var tvPowerState: Bool?
     var shieldPowerState: Bool?
+    var xboxPowerState: Bool?
     var roonRunning: Bool = false
     var statusTimer: Timer?
     var cxnToggle: ToggleRowView!
@@ -602,6 +638,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shieldItem.view = shieldRow
         menu.addItem(shieldItem)
 
+        // Xbox Status (display only — CEC linked to TV, independent power)
+        let xboxRow = StatusRowView(title: "Xbox", icon: "xbox.logo", isOn: xboxPowerState)
+        xboxRow.statusLabel.stringValue = xboxPowerState == true ? "On" : "Off"
+        let xboxItem = NSMenuItem()
+        xboxItem.view = xboxRow
+        menu.addItem(xboxItem)
+
         menu.addItem(NSMenuItem.separator())
 
         // ── SESSIONS ──
@@ -662,6 +705,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if power == true { self?.tv.knownOff = false }
                 self?.tvPowerState = power
                 self?.shieldPowerState = power
+                self?.buildMenuIfNeeded()
+            }
+        }
+
+        xbox.getState { [weak self] power in
+            DispatchQueue.main.async {
+                self?.xboxPowerState = power
                 self?.buildMenuIfNeeded()
             }
         }
