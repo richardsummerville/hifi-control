@@ -129,11 +129,66 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     }
 }
 
+// MARK: - Shield App Registry
+
+struct ShieldApp {
+    let name: String
+    let package: String
+    let iconFile: String?       // PNG filename (without extension) in icons/
+    let iconFallback: String    // SF Symbol fallback
+}
+
+let shieldAppRegistry: [ShieldApp] = [
+    ShieldApp(name: "Plex", package: "com.plexapp.android", iconFile: "plex", iconFallback: "film.fill"),
+    ShieldApp(name: "Plexamp", package: "tv.plex.labs.plexamp", iconFile: "plexamp", iconFallback: "waveform"),
+    ShieldApp(name: "Netflix", package: "com.netflix.ninja", iconFile: "netflix", iconFallback: "play.rectangle.fill"),
+    ShieldApp(name: "Disney+", package: "com.disney.disneyplus", iconFile: "disney", iconFallback: "sparkles"),
+    ShieldApp(name: "Apple TV", package: "com.apple.atve.androidtv.appletv", iconFile: "appletv", iconFallback: "appletv.fill"),
+    ShieldApp(name: "Amazon Prime", package: "com.amazon.amazonvideo.livingroom", iconFile: "prime", iconFallback: "shippingbox.fill"),
+    ShieldApp(name: "YouTube", package: "com.google.android.youtube.tv", iconFile: nil, iconFallback: "play.rectangle.fill"),
+    ShieldApp(name: "Stremio", package: "com.stremio.one", iconFile: "stremio", iconFallback: "popcorn.fill"),
+    ShieldApp(name: "MUBI", package: "com.mubi", iconFile: "mubi", iconFallback: "film.stack.fill"),
+    ShieldApp(name: "BBC iPlayer", package: "com.nvidia.bbciplayer", iconFile: "bbc", iconFallback: "play.tv.fill"),
+    ShieldApp(name: "ITV", package: "air.ITVMobilePlayer", iconFile: "itv", iconFallback: "play.tv.fill"),
+    ShieldApp(name: "Channel 4", package: "com.channel4.ondemand", iconFile: nil, iconFallback: "play.tv.fill"),
+    ShieldApp(name: "Tidal", package: "com.aspiro.tidal", iconFile: "tidal", iconFallback: "music.note"),
+    ShieldApp(name: "VLC", package: "org.videolan.vlc", iconFile: "vlc", iconFallback: "play.circle.fill"),
+    ShieldApp(name: "RetroArch", package: "retrobox.v2.retroarch", iconFile: "retroarch", iconFallback: "gamecontroller.fill"),
+    ShieldApp(name: "My5", package: "com.channel5.my5", iconFile: "my5", iconFallback: "play.tv.fill"),
+]
+
+func loadAppIcon(_ app: ShieldApp, size: CGFloat = 16) -> NSImage? {
+    if let file = app.iconFile {
+        let paths = [
+            NSString(string: "~/Documents/Projects/home-control/MenuBarApp/icons/\(file).png").expandingTildeInPath,
+            "icons/\(file).png"
+        ]
+        for path in paths {
+            if let img = NSImage(contentsOfFile: path) {
+                img.size = NSSize(width: size, height: size)
+                return img
+            }
+        }
+    }
+    let config = NSImage.SymbolConfiguration(pointSize: size - 3, weight: .medium)
+    return NSImage(systemSymbolName: app.iconFallback, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+}
+
 // MARK: - Settings
 
 class Settings {
     static let shared = Settings()
     private let defaults = UserDefaults.standard
+
+    func isServiceEnabled(_ package: String) -> Bool {
+        // Default all to enabled if never set
+        if defaults.object(forKey: "service_\(package)") == nil { return true }
+        return defaults.bool(forKey: "service_\(package)")
+    }
+
+    func setServiceEnabled(_ package: String, enabled: Bool) {
+        defaults.set(enabled, forKey: "service_\(package)")
+    }
 
     var launchAtLogin: Bool {
         get { defaults.bool(forKey: "launchAtLogin") }
@@ -823,6 +878,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shieldItem.view = shieldToggle
         menu.addItem(shieldItem)
 
+        // Shield Services submenu (filtered by settings)
+        let enabledApps = shieldAppRegistry.filter { Settings.shared.isServiceEnabled($0.package) }
+        if !enabledApps.isEmpty {
+            let servicesItem = NSMenuItem(title: "  Services", action: nil, keyEquivalent: "")
+            servicesItem.image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: nil)
+            let servicesMenu = NSMenu()
+            for app in enabledApps {
+                let item = NSMenuItem(title: app.name, action: #selector(launchShieldService(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = app.package
+                item.image = loadAppIcon(app)
+                servicesMenu.addItem(item)
+            }
+            servicesItem.submenu = servicesMenu
+            menu.addItem(servicesItem)
+        }
+
         // Xbox Status (display only — CEC linked to TV, independent power)
         let xboxRow = StatusRowView(title: "Xbox", icon: "xbox.logo", isOn: xboxPowerState)
         xboxRow.statusLabel.stringValue = xboxPowerState == true ? "On" : "Off"
@@ -896,6 +968,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         launchItem.target = self
         launchItem.state = Settings.shared.launchAtLogin ? .on : .off
         settingsMenu.addItem(launchItem)
+
+        // Shield Services visibility
+        let servicesSettingsItem = NSMenuItem(title: "Shield Services", action: nil, keyEquivalent: "")
+        let servicesSettingsMenu = NSMenu()
+        for app in shieldAppRegistry {
+            let item = NSMenuItem(title: app.name, action: #selector(toggleServiceVisibility(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = app.package
+            item.state = Settings.shared.isServiceEnabled(app.package) ? .on : .off
+            servicesSettingsMenu.addItem(item)
+        }
+        servicesSettingsItem.submenu = servicesSettingsMenu
+        settingsMenu.addItem(servicesSettingsItem)
 
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
@@ -1095,9 +1180,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc func launchShieldService(_ sender: NSMenuItem) {
+        guard let package = sender.representedObject as? String else { return }
+        shield.ensureConnected { [self] _ in
+            shield.wake { [self] _ in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/adb")
+                    process.arguments = ["-s", "\(self.shield.host):5555", "shell",
+                                         "monkey", "-p", package, "-c",
+                                         "android.intent.category.LEANBACK_LAUNCHER", "1"]
+                    try? process.run()
+                    process.waitUntilExit()
+                }
+            }
+        }
+    }
+
     @objc func scanPlexMovies() { plex.scanLibrary("1") { _ in } }
     @objc func scanPlexTV() { plex.scanLibrary("3") { _ in } }
     @objc func scanPlexMusic() { plex.scanLibrary("2") { _ in } }
+
+    @objc func toggleServiceVisibility(_ sender: NSMenuItem) {
+        guard let package = sender.representedObject as? String else { return }
+        let current = Settings.shared.isServiceEnabled(package)
+        Settings.shared.setServiceEnabled(package, enabled: !current)
+        buildMenu()
+    }
 
     @objc func toggleLaunchAtLogin() {
         Settings.shared.launchAtLogin.toggle()
