@@ -17,7 +17,10 @@
 ## Phase 3: Device Support
 - [ ] Cambridge Audio — full StreamMagic range (CXN, EVO, MXN, AXN)
 - [ ] LG webOS — tested across model years (C/G/A series)
-- [ ] NVIDIA Shield — ADB control if network debugging enabled
+- [x] NVIDIA Shield — ADB control (wake, sleep, app launch)
+- [x] Xbox — SSDP status polling
+- [x] Plex Media Server — session count, library scan triggers
+- [ ] LG TV app launcher — SSAP `system.launcher/launch` for webOS apps (Netflix, Disney+, iPlayer, etc.)
 - [ ] Sony Bravia (REST API)
 - [ ] Samsung Tizen (WebSocket)
 - [ ] Apple TV (MRP protocol)
