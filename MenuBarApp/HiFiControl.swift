@@ -427,17 +427,40 @@ class XboxController {
     let host = "192.168.x.x"
 
     func getState(completion: @escaping (Bool?) -> Void) {
-        // Xbox exposes UPnP on port 2869 when awake
-        let url = URL(string: "http://\(host):2869/upnphost/udhisapi.dll?content=uuid:94234162-37d7-454d-9d9f-bc3c5de88df3")!
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 2
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+        // Xbox responds to SSDP unicast when awake, silent in standby
+        DispatchQueue.global().async {
+            let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            guard sock >= 0 else { completion(nil); return }
+
+            var timeout = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = UInt16(1900).bigEndian
+            addr.sin_addr.s_addr = inet_addr(self.host)
+
+            let msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n"
+            let sent = msg.withCString { ptr in
+                withUnsafePointer(to: &addr) { addrPtr in
+                    addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddr in
+                        sendto(sock, ptr, strlen(ptr), 0, sockAddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+
+            guard sent > 0 else { close(sock); completion(nil); return }
+
+            var buf = [UInt8](repeating: 0, count: 2048)
+            let n = recv(sock, &buf, buf.count, 0)
+            close(sock)
+
+            if n > 0 {
                 completion(true)
             } else {
                 completion(false)
             }
-        }.resume()
+        }
     }
 }
 
