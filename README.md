@@ -1,5 +1,7 @@
 # HiFi Control
 
+> **Experimental** — This is a personal project exploring local network control of home AV devices from the macOS menu bar. It works for the specific hardware listed below, but is not yet a general-purpose tool. See [ROADMAP.md](ROADMAP.md) for the plan to make it configurable and distributable.
+
 A native macOS menu bar app for controlling home audio/video devices over the local network.
 
 Built in Swift with zero dependencies — uses WebSocket, HTTP, Wake-on-LAN, and mDNS discovery to communicate directly with devices.
