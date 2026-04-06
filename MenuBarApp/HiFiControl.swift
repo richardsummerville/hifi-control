@@ -650,34 +650,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func pollState() {
         guard !busyLock else { return }
 
-        let group = DispatchGroup()
-
-        group.enter()
         cxn.getState { [weak self] power, volume, source in
             DispatchQueue.main.async {
                 self?.cxnPowerState = power
-                group.leave()
+                self?.buildMenuIfNeeded()
             }
         }
 
-        group.enter()
         tv.getState { [weak self] power in
             DispatchQueue.main.async {
                 if power == true { self?.tv.knownOff = false }
                 self?.tvPowerState = power
-                group.leave()
+                self?.shieldPowerState = power
+                self?.buildMenuIfNeeded()
             }
         }
+    }
 
-        group.enter()
-        // Shield follows TV via HDMI-CEC — mirror TV state
-        DispatchQueue.main.async { [weak self] in
-            self?.shieldPowerState = self?.tvPowerState
-            group.leave()
-        }
-
-        group.notify(queue: .main) { [weak self] in
-            self?.buildMenu()
+    private var lastMenuBuild: Date = .distantPast
+    func buildMenuIfNeeded() {
+        // Debounce — only rebuild once per poll cycle
+        let now = Date()
+        if now.timeIntervalSince(lastMenuBuild) > 0.3 {
+            lastMenuBuild = now
+            // Delay slightly to let both callbacks arrive
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.buildMenu()
+            }
         }
     }
 
