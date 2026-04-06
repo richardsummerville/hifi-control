@@ -8,9 +8,39 @@ import ServiceManagement
 class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     static let shared = DeviceDiscovery()
 
+    // Default IPs — override via mDNS discovery or DHCP reservation
     var cxnHost: String = "192.168.x.x"
     var tvHost: String = "192.168.x.x"
-    let tvMAC = "XX:XX:XX:XX:XX:XX"
+    var tvMAC: String = ""
+
+    override init() {
+        super.init()
+        loadConfig()
+    }
+
+    private func loadConfig() {
+        // Read config.local from app bundle's parent or working directory
+        let paths = [
+            NSString(string: "~/Documents/Projects/home-control/config.local").expandingTildeInPath,
+            "config.local"
+        ]
+        for path in paths {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for line in content.components(separatedBy: "\n") {
+                let parts = line.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let key = parts[0].trimmingCharacters(in: .whitespaces)
+                let val = parts[1].trimmingCharacters(in: .whitespaces)
+                switch key {
+                case "TV_MAC": tvMAC = val
+                case "CXN_IP": cxnHost = val
+                case "TV_IP": tvHost = val
+                default: break
+                }
+            }
+            break
+        }
+    }
 
     private var browser: NetServiceBrowser?
     private var services: [NetService] = []
@@ -32,6 +62,7 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     }
 
     private func resolveTVFromARP() {
+        guard !tvMAC.isEmpty else { return }
         DispatchQueue.global().async { [self] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
@@ -316,7 +347,10 @@ class LGTVController {
 
     func powerOn(completion: @escaping (Bool) -> Void) {
         // Wake-on-LAN magic packet
-        let macBytes: [UInt8] = [0x20, 0x28, 0xBC, 0x1A, 0x59, 0xFE]
+        let mac = DeviceDiscovery.shared.tvMAC
+        guard !mac.isEmpty else { completion(false); return }
+        let macBytes: [UInt8] = mac.split(separator: ":").compactMap { UInt8($0, radix: 16) }
+        guard macBytes.count == 6 else { completion(false); return }
         var packet = [UInt8](repeating: 0xFF, count: 6)
         for _ in 0..<16 {
             packet.append(contentsOf: macBytes)

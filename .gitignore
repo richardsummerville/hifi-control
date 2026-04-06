@@ -3,3 +3,4 @@ node_modules/
 *.o
 MenuBarApp/HiFiControl
 MenuBarApp/HiFi Control.app/Contents/MacOS/HiFi Control
+config.local
