@@ -3,7 +3,7 @@
 import WebSocket from 'ws';
 import { execSync } from 'child_process';
 
-const CXN_HOST = '192.168.x.x';
+const CXN_HOST = process.env.CXN_IP || '0.0.0.0';
 
 function sendCXN(params) {
   return new Promise((resolve, reject) => {

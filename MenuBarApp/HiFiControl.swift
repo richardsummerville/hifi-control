@@ -8,15 +8,15 @@ import ServiceManagement
 class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     static let shared = DeviceDiscovery()
 
-    // Default IPs — override via mDNS discovery or DHCP reservation
-    var cxnHost: String = "192.168.x.x"
-    var tvHost: String = "192.168.x.x"
+    // Defaults — override via config.local or mDNS discovery
+    var cxnHost: String = "0.0.0.0"
+    var tvHost: String = "0.0.0.0"
     var tvMAC: String = ""
-    var shieldHost: String = "192.168.x.x"
-    var xboxHost: String = "192.168.x.x"
-    var plexHost: String = "192.168.x.x"
+    var shieldHost: String = "0.0.0.0"
+    var xboxHost: String = "0.0.0.0"
+    var plexHost: String = "0.0.0.0"
     var plexToken: String = ""
-    var imacHost: String = "192.168.x.x"
+    var imacHost: String = "0.0.0.0"
 
     override init() {
         super.init()
@@ -175,6 +175,8 @@ func loadAppIcon(_ app: ShieldApp, size: CGFloat = 16) -> NSImage? {
     }
     let config = NSImage.SymbolConfiguration(pointSize: size - 3, weight: .medium)
     let img = NSImage(systemSymbolName: app.iconFallback, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    // Tint SF Symbol fallback icons (e.g. YouTube red). sourceAtop composites
+    // the colour only where the symbol has pixels, preserving transparency.
     if let color = app.iconColor, let img = img {
         let tinted = NSImage(size: img.size, flipped: false) { rect in
             img.draw(in: rect)
@@ -277,6 +279,7 @@ class CXNController {
         }.resume()
     }
 
+    // Full off→on cycle with 3s gap. Used by Roon session to ensure clean initialisation.
     func powerCycle(completion: @escaping (Bool) -> Void) {
         sendPower(false) { _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
@@ -360,7 +363,8 @@ class LGTVController {
         }
     }
 
-    // Track local state after explicit power off
+    // Avoids a 4-second WebSocket timeout on every poll after explicit power off.
+    // Reset when WoL is sent or when a poll detects the TV is back on.
     var knownOff = false
 
     func getState(completion: @escaping (Bool?) -> Void) {
@@ -385,6 +389,7 @@ class LGTVController {
             return
         }
 
+        // Guard against multiple completions — timeout and receive can race
         var completed = false
         let finish: (Bool?) -> Void = { result in
             guard !completed else { return }
@@ -442,6 +447,7 @@ class LGTVController {
         guard !mac.isEmpty else { completion(false); return }
         let macBytes: [UInt8] = mac.split(separator: ":").compactMap { UInt8($0, radix: 16) }
         guard macBytes.count == 6 else { completion(false); return }
+        // WoL magic packet: 6 bytes of 0xFF followed by MAC address repeated 16 times
         var packet = [UInt8](repeating: 0xFF, count: 6)
         for _ in 0..<16 {
             packet.append(contentsOf: macBytes)
@@ -454,6 +460,8 @@ class LGTVController {
         var broadcastEnable: Int32 = 1
         setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, socklen_t(MemoryLayout<Int32>.size))
 
+        // Broadcast to subnet, global, and unicast — redundancy increases reliability
+        // as some routers/switches handle broadcast forwarding differently
         let targets = ["192.168.0.255", "255.255.255.255", host]
         var sent: Int = 0
         for target in targets {
@@ -511,7 +519,8 @@ class ShieldController {
     }
 
     func getState(completion: @escaping (Bool?) -> Void) {
-        // Reconnect ADB first (session drops after inactivity), then check power state
+        // ADB TCP sessions silently drop after ~60s inactivity.
+        // Must reconnect before every state check or commands fail silently.
         ensureConnected { [self] connected in
             guard connected else {
                 completion(nil)
@@ -606,7 +615,9 @@ class XboxController {
             addr.sin_port = UInt16(1900).bigEndian
             addr.sin_addr.s_addr = inet_addr(self.host)
 
-            let msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n"
+            // Xbox supports DIAL (Discovery and Launch) — responds to this SSDP search
+        // target when awake, silent in standby. 2s timeout = offline.
+        let msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n"
             let sent = msg.withCString { ptr in
                 withUnsafePointer(to: &addr) { addrPtr in
                     addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddr in
@@ -1086,6 +1097,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         tv.getState { [weak self] power in
             DispatchQueue.main.async {
+                // TV came back on (maybe via physical remote) — clear the knownOff shortcut
                 if power == true { self?.tv.knownOff = false }
                 self?.tvPowerState = power
                 self?.buildMenuIfNeeded()
@@ -1124,11 +1136,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var lastMenuBuild: Date = .distantPast
     func buildMenuIfNeeded() {
-        // Debounce — only rebuild once per poll cycle
+        // 6 devices poll concurrently — callbacks arrive at different times.
+        // Without debouncing, the menu rebuilds 6 times per cycle causing flicker.
+        // 0.3s gate + 0.5s delay lets most callbacks settle before a single rebuild.
         let now = Date()
         if now.timeIntervalSince(lastMenuBuild) > 0.3 {
             lastMenuBuild = now
-            // Delay slightly to let both callbacks arrive
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 self?.buildMenu()
             }

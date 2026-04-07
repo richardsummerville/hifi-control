@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-const CXN_HOST = '192.168.x.x';
+const CXN_HOST = process.env.CXN_IP || '0.0.0.0';
 const ws = new WebSocket(`ws://${CXN_HOST}:80/smoip`, {
   headers: {
     Origin: `ws://${CXN_HOST}`,
