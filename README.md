@@ -59,12 +59,12 @@ cp -r "HiFi Control.app" /Applications/
 Create `config.local` in the project root (gitignored):
 
 ```
-TV_MAC=aa:bb:cc:dd:ee:ff
-CXN_IP=192.168.x.x
-TV_IP=192.168.x.x
-SHIELD_IP=192.168.x.x
-XBOX_IP=192.168.x.x
-PLEX_IP=192.168.x.x
+TV_MAC=AA:BB:CC:DD:EE:FF
+CXN_IP=192.168.1.x
+TV_IP=192.168.1.x
+SHIELD_IP=192.168.1.x
+XBOX_IP=192.168.1.x
+PLEX_IP=192.168.1.x
 PLEX_TOKEN=your_plex_token_here
 ```
 
