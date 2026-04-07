@@ -16,6 +16,7 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     var xboxHost: String = "192.168.x.x"
     var plexHost: String = "192.168.x.x"
     var plexToken: String = ""
+    var imacHost: String = "192.168.x.x"
 
     override init() {
         super.init()
@@ -43,6 +44,7 @@ class DeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
                 case "XBOX_IP": xboxHost = val
                 case "PLEX_IP": plexHost = val
                 case "PLEX_TOKEN": plexToken = val
+                case "IMAC_IP": imacHost = val
                 default: break
                 }
             }
@@ -136,6 +138,7 @@ struct ShieldApp {
     let package: String
     let iconFile: String?       // PNG filename (without extension) in icons/
     let iconFallback: String    // SF Symbol fallback
+    var iconColor: NSColor?     // Tint for SF Symbol fallback
 }
 
 let shieldAppRegistry: [ShieldApp] = [
@@ -145,12 +148,12 @@ let shieldAppRegistry: [ShieldApp] = [
     ShieldApp(name: "Disney+", package: "com.disney.disneyplus", iconFile: "disney", iconFallback: "sparkles"),
     ShieldApp(name: "Apple TV", package: "com.apple.atve.androidtv.appletv", iconFile: "appletv", iconFallback: "appletv.fill"),
     ShieldApp(name: "Amazon Prime", package: "com.amazon.amazonvideo.livingroom", iconFile: "prime", iconFallback: "shippingbox.fill"),
-    ShieldApp(name: "YouTube", package: "com.google.android.youtube.tv", iconFile: nil, iconFallback: "play.rectangle.fill"),
+    ShieldApp(name: "YouTube", package: "com.google.android.youtube.tv", iconFile: nil, iconFallback: "play.rectangle.fill", iconColor: .systemRed),
     ShieldApp(name: "Stremio", package: "com.stremio.one", iconFile: "stremio", iconFallback: "popcorn.fill"),
     ShieldApp(name: "MUBI", package: "com.mubi", iconFile: "mubi", iconFallback: "film.stack.fill"),
     ShieldApp(name: "BBC iPlayer", package: "com.nvidia.bbciplayer", iconFile: "bbc", iconFallback: "play.tv.fill"),
     ShieldApp(name: "ITV", package: "air.ITVMobilePlayer", iconFile: "itv", iconFallback: "play.tv.fill"),
-    ShieldApp(name: "Channel 4", package: "com.channel4.ondemand", iconFile: nil, iconFallback: "play.tv.fill"),
+    ShieldApp(name: "Channel 4", package: "com.channel4.ondemand", iconFile: "channel4", iconFallback: "play.tv.fill"),
     ShieldApp(name: "Tidal", package: "com.aspiro.tidal", iconFile: "tidal", iconFallback: "music.note"),
     ShieldApp(name: "VLC", package: "org.videolan.vlc", iconFile: "vlc", iconFallback: "play.circle.fill"),
     ShieldApp(name: "RetroArch", package: "retrobox.v2.retroarch", iconFile: "retroarch", iconFallback: "gamecontroller.fill"),
@@ -171,7 +174,18 @@ func loadAppIcon(_ app: ShieldApp, size: CGFloat = 16) -> NSImage? {
         }
     }
     let config = NSImage.SymbolConfiguration(pointSize: size - 3, weight: .medium)
-    return NSImage(systemSymbolName: app.iconFallback, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    let img = NSImage(systemSymbolName: app.iconFallback, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    if let color = app.iconColor, let img = img {
+        let tinted = NSImage(size: img.size, flipped: false) { rect in
+            img.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.isTemplate = false
+        return tinted
+    }
+    return img
 }
 
 // MARK: - Settings
@@ -497,36 +511,26 @@ class ShieldController {
     }
 
     func getState(completion: @escaping (Bool?) -> Void) {
-        // Check screen state via ADB — more reliable than Cast API
-        runADB(["shell", "dumpsys", "power"], timeout: 3) { ok, output in
-            guard ok, let output = output else {
-                // ADB failed — fall back to Cast API
-                self.getCastState(completion: completion)
+        // Reconnect ADB first (session drops after inactivity), then check power state
+        ensureConnected { [self] connected in
+            guard connected else {
+                completion(nil)
                 return
             }
-            if output.contains("mWakefulness=Awake") {
-                completion(true)
-            } else if output.contains("mWakefulness=Asleep") || output.contains("mWakefulness=Dozing") {
-                completion(false)
-            } else {
-                completion(nil)
+            runADB(["shell", "dumpsys", "power"], timeout: 3) { ok, output in
+                guard ok, let output = output else {
+                    completion(nil)
+                    return
+                }
+                if output.contains("mWakefulness=Awake") {
+                    completion(true)
+                } else if output.contains("mWakefulness=Asleep") || output.contains("mWakefulness=Dozing") {
+                    completion(false)
+                } else {
+                    completion(nil)
+                }
             }
         }
-    }
-
-    private func getCastState(completion: @escaping (Bool?) -> Void) {
-        let url = URL(string: "http://\(host):8008/setup/eureka_info?params=name")!
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 2
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               json["name"] != nil {
-                completion(true)
-            } else {
-                completion(nil)
-            }
-        }.resume()
     }
 
     func wake(completion: @escaping (Bool) -> Void) {
@@ -671,6 +675,36 @@ class PlexController {
     }
 }
 
+// MARK: - iMac Status
+
+class IMacController {
+    var host: String { DeviceDiscovery.shared.imacHost }
+
+    func getState(completion: @escaping (Bool?) -> Void) {
+        DispatchQueue.global().async {
+            let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+            guard sock >= 0 else { completion(nil); return }
+
+            var timeout = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = UInt16(22).bigEndian
+            addr.sin_addr.s_addr = inet_addr(self.host)
+
+            let result = withUnsafePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddr in
+                    connect(sock, sockAddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+
+            close(sock)
+            completion(result == 0 ? true : false)
+        }
+    }
+}
+
 // MARK: - Toggle Row View
 
 class ToggleRowView: NSView {
@@ -680,7 +714,9 @@ class ToggleRowView: NSView {
     let iconView = NSImageView()
     var onToggle: ((Bool) -> Void)?
 
-    init(title: String, icon: String, width: CGFloat = 280) {
+    let roomLabel = NSTextField(labelWithString: "")
+
+    init(title: String, icon: String, room: String? = nil, width: CGFloat = 280) {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 44))
 
         // Icon
@@ -695,8 +731,18 @@ class ToggleRowView: NSView {
         label.stringValue = title
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.textColor = .labelColor
-        label.frame = NSRect(x: 44, y: 22, width: 160, height: 16)
+        label.frame = NSRect(x: 44, y: 22, width: 120, height: 16)
         addSubview(label)
+
+        // Room label (right of title)
+        if let room = room {
+            roomLabel.stringValue = room
+            roomLabel.font = .systemFont(ofSize: 11)
+            roomLabel.textColor = .tertiaryLabelColor
+            roomLabel.alignment = .right
+            roomLabel.frame = NSRect(x: 140, y: 23, width: 80, height: 14)
+            addSubview(roomLabel)
+        }
 
         // Status subtitle
         statusLabel.font = .systemFont(ofSize: 11)
@@ -739,7 +785,9 @@ class StatusRowView: NSView {
     let iconView = NSImageView()
     let dot = NSTextField(labelWithString: "")
 
-    init(title: String, icon: String, isOn: Bool?, width: CGFloat = 280) {
+    let roomLabel = NSTextField(labelWithString: "")
+
+    init(title: String, icon: String, isOn: Bool?, room: String? = nil, width: CGFloat = 280) {
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 44))
 
         let img = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
@@ -752,8 +800,17 @@ class StatusRowView: NSView {
         label.stringValue = title
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.textColor = .labelColor
-        label.frame = NSRect(x: 44, y: 22, width: 160, height: 16)
+        label.frame = NSRect(x: 44, y: 22, width: 120, height: 16)
         addSubview(label)
+
+        if let room = room {
+            roomLabel.stringValue = room
+            roomLabel.font = .systemFont(ofSize: 11)
+            roomLabel.textColor = .tertiaryLabelColor
+            roomLabel.alignment = .right
+            roomLabel.frame = NSRect(x: 140, y: 23, width: 80, height: 14)
+            addSubview(roomLabel)
+        }
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
@@ -799,11 +856,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let shield = ShieldController()
     let xbox = XboxController()
     let plex = PlexController()
+    let imac = IMacController()
     var cxnPowerState: Bool?
     var tvPowerState: Bool?
     var shieldPowerState: Bool?
     var xboxPowerState: Bool?
     var plexOnline: Bool?
+    var imacOnline: Bool?
     var plexSessions: Int = 0
     var roonRunning: Bool = false
     var statusTimer: Timer?
@@ -843,7 +902,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(devicesHeader)
 
         // CXN Toggle
-        cxnToggle = ToggleRowView(title: "CXN v2", icon: "hifispeaker.fill")
+        cxnToggle = ToggleRowView(title: "CXN v2", icon: "hifispeaker.fill", room: "Living Room")
         cxnToggle.setState(cxnPowerState == true)
         cxnToggle.setStatus(cxnPowerState == true ? "On  ·  Roon Ready" : cxnPowerState == false ? "Standby" : "Unreachable")
         cxnToggle.iconView.contentTintColor = cxnPowerState == true ? .controlAccentColor : .secondaryLabelColor
@@ -855,7 +914,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(cxnItem)
 
         // LG TV Toggle
-        tvToggle = ToggleRowView(title: "LG OLED", icon: "tv.fill")
+        tvToggle = ToggleRowView(title: "LG OLED", icon: "tv.fill", room: "Living Room")
         tvToggle.setState(tvPowerState == true)
         tvToggle.setStatus(tvPowerState == true ? "On" : "Off / Standby")
         tvToggle.iconView.contentTintColor = tvPowerState == true ? .controlAccentColor : .secondaryLabelColor
@@ -867,7 +926,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(tvItem)
 
         // Shield Toggle (ADB control)
-        shieldToggle = ToggleRowView(title: "NVIDIA Shield", icon: "gamecontroller.fill")
+        shieldToggle = ToggleRowView(title: "NVIDIA Shield", icon: "gamecontroller.fill", room: "Living Room")
         shieldToggle.setState(shieldPowerState == true)
         shieldToggle.setStatus(shieldPowerState == true ? "Awake" : shieldPowerState == false ? "Asleep" : "Unreachable")
         shieldToggle.iconView.contentTintColor = shieldPowerState == true ? .controlAccentColor : .secondaryLabelColor
@@ -896,11 +955,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Xbox Status (display only — CEC linked to TV, independent power)
-        let xboxRow = StatusRowView(title: "Xbox", icon: "xbox.logo", isOn: xboxPowerState)
+        let xboxRow = StatusRowView(title: "Xbox", icon: "xbox.logo", isOn: xboxPowerState, room: "Living Room")
         xboxRow.statusLabel.stringValue = xboxPowerState == true ? "On" : "Off"
         let xboxItem = NSMenuItem()
         xboxItem.view = xboxRow
         menu.addItem(xboxItem)
+
+        // iMac Status
+        let imacRow = StatusRowView(title: "iMac", icon: "desktopcomputer", isOn: imacOnline, room: "Office")
+        imacRow.statusLabel.stringValue = imacOnline == true ? "Online" : imacOnline == false ? "Offline" : "Unknown"
+        let imacItem = NSMenuItem()
+        imacItem.view = imacRow
+        menu.addItem(imacItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -932,9 +998,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             plexStatus = "Server offline"
         }
         plexToggle = ToggleRowView(title: "Plex", icon: "film.fill")
+        // Use Plex PNG icon
+        let plexIconPaths = [
+            NSString(string: "~/Documents/Projects/home-control/MenuBarApp/icons/plex.png").expandingTildeInPath,
+            "icons/plex.png"
+        ]
+        for path in plexIconPaths {
+            if let img = NSImage(contentsOfFile: path) {
+                img.size = NSSize(width: 16, height: 16)
+                plexToggle.iconView.image = img
+                plexToggle.iconView.contentTintColor = nil
+                break
+            }
+        }
         plexToggle.setState(shieldPowerState == true && plexOnline == true)
         plexToggle.setStatus(plexStatus)
-        plexToggle.iconView.contentTintColor = plexOnline == true ? .systemOrange : .secondaryLabelColor
         plexToggle.onToggle = { [weak self] on in
             self?.togglePlex(on)
         }
@@ -1032,6 +1110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self?.plexOnline = online
                 self?.plexSessions = sessions ?? 0
+                self?.buildMenuIfNeeded()
+            }
+        }
+
+        imac.getState { [weak self] online in
+            DispatchQueue.main.async {
+                self?.imacOnline = online
                 self?.buildMenuIfNeeded()
             }
         }
