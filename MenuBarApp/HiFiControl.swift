@@ -526,7 +526,10 @@ class ShieldController {
                 completion(nil)
                 return
             }
-            runADB(["shell", "dumpsys", "power"], timeout: 3) { ok, output in
+            // Filter on-device: raw `dumpsys power` is ~100KB and deadlocks
+            // the Swift Pipe (64KB buffer) since we don't drain it until after
+            // waitUntilExit. Piping through grep keeps the output to ~50 bytes.
+            runADB(["shell", "dumpsys power | grep mWakefulness"], timeout: 3) { ok, output in
                 guard ok, let output = output else {
                     completion(nil)
                     return
