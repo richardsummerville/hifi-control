@@ -652,8 +652,9 @@ class PlexController {
 
     func getState(completion: @escaping (Bool?, Int?) -> Void) {
         guard !token.isEmpty else { completion(nil, nil); return }
-        let url = URL(string: "http://\(host):32400/status/sessions?X-Plex-Token=\(token)")!
+        let url = URL(string: "http://\(host):32400/status/sessions")!
         var request = URLRequest(url: url)
+        request.setValue(token, forHTTPHeaderField: "X-Plex-Token")
         request.timeoutInterval = 3
         URLSession.shared.dataTask(with: request) { data, response, error in
             guard let data = data,
@@ -678,8 +679,9 @@ class PlexController {
 
     func scanLibrary(_ key: String, completion: @escaping (Bool) -> Void) {
         guard !token.isEmpty else { completion(false); return }
-        let url = URL(string: "http://\(host):32400/library/sections/\(key)/refresh?X-Plex-Token=\(token)")!
+        let url = URL(string: "http://\(host):32400/library/sections/\(key)/refresh")!
         var request = URLRequest(url: url)
+        request.setValue(token, forHTTPHeaderField: "X-Plex-Token")
         request.httpMethod = "GET"
         request.timeoutInterval = 5
         URLSession.shared.dataTask(with: request) { _, response, _ in
@@ -1289,8 +1291,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/adb")
                     process.arguments = ["-s", "\(self.shield.host):5555", "shell",
-                                         "monkey", "-p", package, "-c",
-                                         "android.intent.category.LEANBACK_LAUNCHER", "1"]
+                                         "am", "start", "-a", "android.intent.action.MAIN",
+                                         "-c", "android.intent.category.LEANBACK_LAUNCHER",
+                                         package]
                     try? process.run()
                     process.waitUntilExit()
                 }
